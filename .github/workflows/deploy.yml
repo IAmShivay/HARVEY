@@ -1,0 +1,76 @@
+name: Test and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  APP_DIR: app
+  SERVICES: harvey-run.service harvey-dashboard.service
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q -p no:cacheprovider tests
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.HARVEY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.HARVEY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Sync code
+        env:
+          HOST: ${{ secrets.HARVEY_HOST }}
+        run: |
+          rsync -az --delete \
+            --exclude '.git/' --exclude '.github/' \
+            --exclude '.venv/' --exclude 'mcp/.venv/' --exclude '__pycache__/' \
+            --exclude 'data/' --exclude 'logs/' \
+            --exclude '.env' --exclude 'harvey.local.yaml' \
+            --exclude 'skills/product_knowledge.md' --exclude 'skills/competitive_intel.md' \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            ./ "harvey@$HOST:$APP_DIR/"
+
+      - name: Install and restart
+        env:
+          HOST: ${{ secrets.HARVEY_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "harvey@$HOST" "
+            set -e
+            cd $APP_DIR
+            .venv/bin/pip install -q -e .
+            for s in $SERVICES; do sudo /usr/bin/systemctl restart \$s; done
+            sleep 10
+            for s in $SERVICES; do systemctl is-active --quiet \$s || { echo \"\$s failed\"; journalctl -u \$s -n 30 --no-pager; exit 1; }; done
+            echo deployed \$(date -u)
+          "
