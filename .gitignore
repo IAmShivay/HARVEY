@@ -62,3 +62,6 @@ harvey.local.yaml.*
 harvey.yaml.*
 config.bat
 node_modules
+
+# env templates stay local; real values live in Infisical
+.env.example
